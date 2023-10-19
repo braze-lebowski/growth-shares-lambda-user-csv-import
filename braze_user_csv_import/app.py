@@ -20,6 +20,7 @@ import csv
 import os
 import ast
 import json
+from collections import defaultdict
 from concurrent.futures.thread import ThreadPoolExecutor
 from typing import Dict, Iterator, List, Optional, Sequence, Type, Union
 
@@ -35,6 +36,8 @@ from tenacity import (
     wait_exponential,  # type: ignore
     retry_if_exception_type  # type: ignore
 )
+
+from . import handlers
 
 
 # 10 minute function timeout
@@ -56,8 +59,7 @@ TypeMap = Dict[str, Type]
 
 
 def lambda_handler(event, context):
-    """Receives S3 file upload event and starts processing the CSV file
-    uploaded.
+    """Receives S3 file upload event and starts processing the file.
 
     :param event: Event object containing information about the invoking service
     :param context: Context object, passed to lambda at runtime, providing
@@ -66,56 +68,54 @@ def lambda_handler(event, context):
     print("New CSV to Braze import process started")
     bucket_name = event['Records'][0]['s3']['bucket']['name']
     object_key = unquote_plus(event['Records'][0]['s3']['object']['key'])
-    type_cast = _process_type_cast(os.environ.get('TYPE_CAST'))
 
     print(f"Processing {bucket_name}/{object_key}")
-    csv_processor = CsvProcessor(
+    file_processor = FileProcessor(
         bucket_name,
         object_key,
         event.get("offset", 0),
-        event.get("headers", None),
-        type_cast
+        event.get("source", None),
     )
 
     try:
-        csv_processor.process_file(context)
+        file_processor.process_file()
     except Exception as e:
         fatal_event = _create_event(
             event,
-            csv_processor.total_offset,
-            csv_processor.headers
+            file_processor.total_offset,
+            file_processor.headers
         )
-        _handle_fatal_error(e, csv_processor.processed_users,
+        _handle_fatal_error(e, file_processor.processed_rows,
                             fatal_event, object_key)
         raise
 
-    print(f"Processed {csv_processor.processed_users:,} users")
-    if not csv_processor.is_finished():
+    print(f"Processed {file_processor.processed_rows:,} rows")
+    if not file_processor.is_finished():
         _start_next_process(
             context.function_name,
             event,
-            csv_processor.total_offset,
-            csv_processor.headers
+            file_processor.total_offset,
+            file_processor.headers
         )
     else:
         print(f"File {object_key} import is complete")
 
-    _publish_message(object_key, True, csv_processor.processed_users)
+    _publish_message(object_key, True, file_processor.processed_rows)
     return {
-        "users_processed": csv_processor.processed_users,
-        "bytes_read": csv_processor.total_offset - event.get("offset", 0),
-        "is_finished": csv_processor.is_finished()
+        "users_processed": file_processor.processed_rows,
+        "bytes_read": file_processor.total_offset - event.get("offset", 0),
+        "is_finished": file_processor.is_finished()
     }
 
 
-class CsvProcessor:
+class FileProcessor:
     """Class responsible for reading and processing the CSV file, and delegating
     the user attribute update to background threads.
 
     :param bucket_name: S3 bucket name to get the object from
     :param object_key: S3 object key of the CSV file to process
     :param offset: Amount of bytes read already from the file
-    :param headers: CSV file headers
+    :param source: a string which determines which processor to use to parse the data.
     """
 
     def __init__(
@@ -123,61 +123,41 @@ class CsvProcessor:
         bucket_name: str,
         object_key: str,
         offset: int = 0,
-        headers: Optional[List[str]] = None,
-        type_cast: Optional[TypeMap] = None
+        source: Optional[str] = None,
     ) -> None:
         self.processing_offset = 0
         self.total_offset = offset
-        self.csv_file = _get_file_from_s3(bucket_name, object_key)
-        self.headers = headers
-        self.type_cast = type_cast or {}
+        self.file = _get_file_from_s3(bucket_name, object_key)
+        self.source = source or handlers.determine_source(bucket_name, object_key)
 
-        self.processed_users = 0
+        self.processed_rows = 0
 
-    def process_file(self, context) -> None:
-        """Processes the CSV file.
 
-        It reads the file by 10MB chunks and iterates over each line.
-        It collects users into 75-user chunks which is the maximum amount
-        of users Braze API accepts. Once there are enough chunks collected,
-        it uploads them concurrently from background threads.
-        The number of background threads used and the number of user chunks
-        collected is equal to `MAX_THREADS`.
+    def process_file(self) -> None:
+        """Processes the file.
 
-        :param context: Context object providing information about the
-                        function and runtime environment
+        It reads the file by 10MB chunks.
+        It parsers the chunk using a defined parser based on the source.
+        It converts each row to a users/track payload.
+        It groups the payloads to minimise requests made.
+        It makes the requests to the users/track endpoint.
         """
-        reader = csv.DictReader(self.iter_lines(), fieldnames=self.headers)
-        _verify_headers(reader.fieldnames, self.type_cast)
-        self.headers = reader.fieldnames or self.headers
+        for chunk in self.iter_lines():
+            parser = handlers.get_parser(self.source)
+            rows: List[Dict] = parser(chunk)
+            payloads = defaultdict(list)
+            for row in rows:
+                destination = handlers.determine_destination(row)
+                row_handler = handlers.get_row_handler(destination)
+                payload = row_handler(payload)
+                payloads[destination].append(payload)
 
-        user_rows, user_row_chunks = [], []
-        for row in reader:
-            try:
-                processed_row = _process_row(row, self.type_cast)
-            except Exception as e:
-                print(
-                    f"ERROR: Could not process row - {str(e)}. Failing row: {dict(row)}")
-                continue
+            grouped_payloads = handlers.chunk_grouper(payloads)
+        
+            for destination_key, payloads in grouped_payloads.items():
+                self.post_users(destination_key, payloads)
+        return
 
-            if len(processed_row) <= 1:
-                continue
-
-            user_rows.append(processed_row)
-            if len(user_rows) == 75:
-                user_row_chunks.append(user_rows)
-                user_rows = []
-
-            if len(user_row_chunks) == MAX_THREADS:
-                self.post_users(user_row_chunks)
-                if _should_terminate(context):
-                    break
-                user_row_chunks = []
-
-        else:  # no break
-            if user_rows:
-                user_row_chunks.append(user_rows)
-            self.post_users(user_row_chunks)
 
     def iter_lines(self) -> Iterator:
         """Iterates over lines in the object.
@@ -196,27 +176,29 @@ class CsvProcessor:
                 last_newline = data.rfind(b'\n')
                 data, leftover = data[:last_newline], data[last_newline:]
 
+            rows = []
             for line in data.splitlines(keepends=True):
                 self.processing_offset += len(line)
-                yield line.decode("utf-8")
+                rows.append(line.decode("utf-8"))
+            
+            yield rows
 
         # Last empty new line in the file
         if leftover == b'\n':
             self.total_offset += len(leftover)
 
-    def post_users(self, user_chunks: List[List]) -> None:
+    def post_users(self, destination_key, api_payload_chunks: List[List[Dict]]) -> None:
         """Posts updated users to Braze platform using Braze API.
 
-        :param user_chunks: List containing chunked user lists of maximum 75
-                            users
+        :param api_payload_chunks: List of chunked payloads
         """
-        updated = _post_users(user_chunks)
-        self.processed_users += updated
+        updated = _post_users(destination_key, api_payload_chunks)
+        self.processed_rows += updated
         self._move_offset()
 
     def is_finished(self) -> bool:
         """Returns whether the end of file was reached or there were no rows in the file."""
-        return not self.processed_users or not self.total_offset or self.total_offset >= self.csv_file.content_length
+        return not self.processed_rows or not self.total_offset or self.total_offset >= self.csv_file.content_length
 
     def _move_offset(self) -> None:
         self.total_offset += self.processing_offset
@@ -240,91 +222,7 @@ def _get_object_stream(s3_object, offset: int):
     return s3_object.get(Range=f"bytes={offset}-")["Body"]
 
 
-def _verify_headers(columns: Optional[Sequence[str]], type_cast: TypeMap) -> None:
-    """Verifies that column follow the established format of
-    `external_id,attr1,...attrN`
-
-    :param columns: CSV file header columns
-    :raises ValueError: if the format didn't meet the requirements
-    """
-    if not columns:
-        return
-
-    if columns[0] != 'external_id':
-        raise ValueError(
-            "ERROR: File headers don't match the expected format."
-            "First column should specify a user's 'external_id'")
-
-    for column_name in type_cast:
-        if column_name not in columns:
-            print(f"WARNING: Cast column {column_name} not found."
-                  "Cast will not be applied")
-
-
-def _process_row(user_row: Dict, type_cast: TypeMap) -> Dict:
-    """Processes a CSV row, evaluating each value type in the row.
-
-    :param user_row: A single row from the CSV file in a dict form
-    """
-    processed_row = {}
-    for col, value in user_row.items():
-        if value is None:
-            print(f"WARNING: None value received for column {col} in row {user_row}")
-            continue
-        if value.strip() == '':
-            continue
-        processed_row[col] = _process_value(value, type_cast.get(col))
-    return processed_row
-
-
-def _process_value(
-    value: str,
-    cast: Type = None
-) -> Union[None, str, int, float, list, bool]:
-    """Processes a single cell value.
-
-    If there is a forced type cast, returns the type casted value.
-    Otherwise, checks the format of the value and returns a correct value type.
-    If values in a column are formatted as a list of values, for example
-    "['Value1', 'Value2']" -- it converts them to an array.
-
-    :param value: Value in the cell
-    :param cast (optional): Forced variable type cast
-    :returns: Value of the proper type
-    """
-    if cast == str:
-        return value
-
-    if cast:
-        return cast(_process_value(value))
-
-    stripped = value.strip().lower()
-    leading_zero_int = len(stripped) > 1 and stripped.startswith('0') \
-        and not stripped.startswith('0.')
-
-    is_numeric = stripped.replace('.', '').replace('-', '').isdigit()
-
-    if stripped == 'null':
-        return None
-    elif is_numeric and not leading_zero_int and _is_int(stripped):
-        return int(stripped)
-    elif is_numeric and not leading_zero_int and _is_float(stripped):
-        return float(stripped)
-    elif stripped == 'true':
-        return True
-    elif stripped == 'false':
-        return False
-    elif len(stripped) > 1 and stripped[0] == '[' and stripped[-1] == ']':
-        try:
-            return ast.literal_eval(stripped)
-        except Exception:
-            print("ERROR: Could not convert value to an array:", stripped)
-            return stripped
-    else:
-        return value
-
-
-def _post_users(user_chunks: List[List]) -> int:
+def _post_users(destination_key: str, api_payloads: List[Dict]) -> int:
     """Posts users concurrently to Braze API, using `MAX_THREADS` concurrent
     threads.
 
@@ -335,8 +233,14 @@ def _post_users(user_chunks: List[List]) -> int:
     :return: Number of users successfully updated
     """
     updated = 0
+    payloads = []
+    for p in api_payloads:
+        payloads.append({
+            'destination_key': destination_key,
+            'payload': p,
+        })
     with ThreadPoolExecutor(max_workers=MAX_THREADS) as executor:
-        results = executor.map(_post_to_braze, user_chunks)
+        results = executor.map(_post_to_braze, api_payloads)
         for result in results:
             updated += result
     return updated
@@ -352,8 +256,8 @@ def _on_network_retry_error(state: RetryCallState):
        stop=stop_after_attempt(MAX_RETRIES),
        after=_on_network_retry_error,
        reraise=True)
-def _post_to_braze(users: List[Dict]) -> int:
-    """Posts users read from the CSV file to Braze users/track API endpoint.
+def _post_to_braze(params: Dict) -> int:
+    """Posts users read from the file to Braze users/track API endpoint.
 
     Authentication is necessary. Braze Rest API key is expected to be passed
     to the lambda process as an environment variable, under `BRAZE_API_KEY` key.
@@ -364,17 +268,27 @@ def _post_to_braze(users: List[Dict]) -> int:
 
     :return: The number of users successfully imported
     """
+    destination_key = params['destination_key']
+    api_payload = params['api_payload']
+    api_url = os.environ[f'{destination_key}__BRAZE_API_URL']
+    api_key = os.environ[f'{destination_key}__BRAZE_API_KEY']
     headers = {
         "Content-Type": "application/json",
-        "Authorization": f"Bearer {BRAZE_API_KEY}",
+        "Authorization": f"Bearer {api_key}",
         "X-Braze-Bulk": "true"
     }
-    data = json.dumps({"attributes": users})
-    response = requests.post(f"{BRAZE_API_URL}/users/track",
-                             headers=headers, data=data)
-
+    response = requests.post(
+        f"https://{api_url}/users/track",
+        headers=headers,
+        json=api_payload
+    )
+    n_payloads = sum(
+        len(api_payload['attributes']),
+        len(api_payload['purchases']),
+        len(api_payload['events']),
+    )
     error_users = _handle_braze_response(response)
-    return len(users) - error_users
+    return len(n_payloads) - error_users
 
 
 def _handle_braze_response(response: requests.Response) -> int:
@@ -439,11 +353,11 @@ def _start_next_process(function_name: str, event: Dict, offset: int,
 
 
 def _create_event(received_event: Dict, byte_offset: int,
-                  headers: Optional[Sequence[str]]) -> Dict:
+                  source: Optional[str]) -> Dict:
     return {
         **received_event,
         "offset": byte_offset,
-        "headers": headers
+        "source": source
     }
 
 
@@ -480,69 +394,18 @@ def _publish_message(file_name: str, success: bool, users_processed: int) -> Non
 
 def _handle_fatal_error(
     error: Exception,
-    processed_users: int,
+    processed_rows: int,
     event: Dict,
     file_name: str
 ) -> None:
     """Prints logging information when a fatal error occurred."""
     print(f'Encountered error: "{error}"')
-    print(f"Processed {processed_users:,} users")
+    print(f"Processed {processed_rows:,} users")
     print(f"Use the event below to continue processing the file:")
     print(json.dumps(event))
 
-    _publish_message(file_name, False, processed_users)
+    _publish_message(file_name, False, processed_rows)
 
-
-TYPE_MAP = {
-    'string': str,
-    'integer': int,
-    'float': float,
-    'boolean': bool
-}
-
-
-def _process_type_cast(type_cast: Optional[str]) -> Dict:
-    """Builds a type casting dictionary where the key represents a column name
-    and the value is the type to cast to.
-    Valid cast types include: string, integer, float and boolean.
-    If the cast type is invalid, the cast will be ignored.
-
-    :param type_cast: Type cast string where each mapping is separate by 
-                      a comma and each cast is specified with column_name=type.
-                      Example:
-                        attribute_name=float,another_name=boolean
-    :returns: Type cast dictionary
-    """
-    cast_map = {}
-    if not type_cast:
-        return cast_map
-
-    for cast in type_cast.split(','):
-        col, t = cast.strip().split('=')
-        try:
-            assert t in TYPE_MAP
-        except AssertionError:
-            print(f"Cast type {t} for column {col} not in supported types."
-                  "Type will not be applied")
-            continue
-        cast_map[col] = TYPE_MAP[t]
-    return cast_map
-
-
-def _is_int(value: str) -> bool:
-    try:
-        int(value)
-        return True
-    except Exception:
-        return False
-
-
-def _is_float(value: str) -> bool:
-    try:
-        float(value)
-        return True
-    except Exception:
-        return False
 
 
 class APIRetryError(RequestException):
